@@ -1,67 +1,162 @@
-import express from 'express';
-import cors from 'cors';
-import crypto from 'crypto';
-import fetch from 'node-fetch';
-import admin from 'firebase-admin';
+// src/server.js
 
+import express from "express";
+import cors from "cors";
+import crypto from "crypto";
+import fetch from "node-fetch";
+import admin from "firebase-admin";
+
+// -------------------- INIT --------------------
+const app = express();
+
+// IMPORTANT: raw body for webhook
+app.use("/webhook", express.raw({ type: "application/json" }));
+
+// normal json for other routes
+app.use(express.json());
+app.use(cors());
+
+// -------------------- FIREBASE --------------------
 admin.initializeApp({
- credential: admin.credential.applicationDefault()
+  credential: admin.credential.cert(
+    JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON)
+  ),
 });
 
 const db = admin.firestore();
-const app = express();
 
-app.use(cors());
-app.use(express.json());
-
-// STK PUSH
-app.post('/stk', async (req,res)=>{
- const {phone,amount} = req.body;
-
- if(amount < 10) return res.status(400).json({message:'Min 10'});
-
- const response = await fetch('https://api.lipana.dev/v1/transactions/push-stk',{
-  method:'POST',
-  headers:{
-   'x-api-key':process.env.LIPANA_API_KEY,
-   'Content-Type':'application/json'
-  },
-  body:JSON.stringify({phone,amount})
- });
-
- const data = await response.json();
-
- await db.collection('transactions').doc(data.data.transactionId).set({
-  phone,amount,status:'pending'
- });
-
- res.json({message:'STK sent'});
+// -------------------- HEALTH CHECK --------------------
+app.get("/", (req, res) => {
+  res.send("API is running 🚀");
 });
 
-// WEBHOOK
-app.post('/webhook', express.raw({type:'application/json'}), async (req,res)=>{
- const signature = req.headers['x-lipana-signature'];
- const payload = req.body;
+// -------------------- STK PUSH --------------------
+app.post("/stk", async (req, res) => {
+  try {
+    const { phone, amount } = req.body;
 
- const expected = crypto.createHmac('sha256', process.env.LIPANA_WEBHOOK_SECRET)
-  .update(payload).digest('hex');
+    // validation
+    if (!phone || !amount) {
+      return res.status(400).json({ error: "Missing phone or amount" });
+    }
 
- if(!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))){
-  return res.status(401).send('Invalid');
- }
+    if (amount < 10) {
+      return res.status(400).json({ error: "Minimum amount is 10" });
+    }
 
- const data = JSON.parse(payload.toString());
+    // call Lipana API
+    const response = await fetch(
+      "https://api.lipana.dev/v1/transactions/push-stk",
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": process.env.LIPANA_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ phone, amount }),
+      }
+    );
 
- const txn = data.data;
+    const data = await response.json();
 
- if(txn.status === 'success'){
-  await db.collection('transactions').doc(txn.transactionId).update({status:'success'});
+    if (!data.success) {
+      return res.status(400).json(data);
+    }
 
-  const userRef = db.collection('users').doc(txn.phone);
-  await userRef.set({credits: admin.firestore.FieldValue.increment(10)}, {merge:true});
- }
+    const txn = data.data;
 
- res.sendStatus(200);
+    // save transaction
+    await db.collection("transactions").doc(txn.transactionId).set({
+      transactionId: txn.transactionId,
+      checkoutRequestID: txn.checkoutRequestID,
+      phone,
+      amount,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    });
+
+    return res.json({
+      message: "STK push sent to phone",
+      transactionId: txn.transactionId,
+    });
+  } catch (err) {
+    console.error("STK ERROR:", err);
+    res.status(500).json({ error: "STK failed" });
+  }
 });
 
-app.listen(3000);
+// -------------------- WEBHOOK --------------------
+app.post("/webhook", async (req, res) => {
+  try {
+    const signature = req.headers["x-lipana-signature"];
+
+    if (!signature) {
+      return res.status(401).send("Missing signature");
+    }
+
+    const payload = req.body; // raw buffer
+
+    // verify signature
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.LIPANA_WEBHOOK_SECRET)
+      .update(payload)
+      .digest("hex");
+
+    if (
+      !crypto.timingSafeEqual(
+        Buffer.from(signature),
+        Buffer.from(expectedSignature)
+      )
+    ) {
+      return res.status(401).send("Invalid signature");
+    }
+
+    // parse JSON AFTER verification
+    const data = JSON.parse(payload.toString());
+
+    const event = data.event;
+    const txn = data.data;
+
+    console.log("Webhook received:", event, txn.transactionId);
+
+    // update transaction
+    const txnRef = db.collection("transactions").doc(txn.transactionId);
+
+    if (event === "payment.success") {
+      await txnRef.update({
+        status: "success",
+        updatedAt: new Date().toISOString(),
+      });
+
+      // add credits to user (using phone as ID for now)
+      const userRef = db.collection("users").doc(txn.phone);
+
+      await userRef.set(
+        {
+          credits: admin.firestore.FieldValue.increment(10),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    }
+
+    if (event === "payment.failed") {
+      await txnRef.update({
+        status: "failed",
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("WEBHOOK ERROR:", err);
+    res.status(500).send("Webhook error");
+  }
+});
+
+// -------------------- START SERVER --------------------
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
