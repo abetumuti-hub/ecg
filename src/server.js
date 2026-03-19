@@ -6,15 +6,23 @@ import crypto from "crypto";
 import fetch from "node-fetch";
 import admin from "firebase-admin";
 
-// -------------------- INIT --------------------
 const app = express();
 
-// IMPORTANT: raw body for webhook
-app.use("/webhook", express.raw({ type: "application/json" }));
+// -------------------- CORS (FIXED) --------------------
+app.use(
+  cors({
+    origin: [
+      "https://ecg-frontend-three.vercel.app",
+      "http://localhost:5173"
+    ],
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-// normal json for other routes
+// -------------------- BODY PARSING --------------------
+app.use("/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
-app.use(cors());
 
 // -------------------- FIREBASE --------------------
 admin.initializeApp({
@@ -25,7 +33,7 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// -------------------- HEALTH CHECK --------------------
+// -------------------- HEALTH --------------------
 app.get("/", (req, res) => {
   res.send("API is running 🚀");
 });
@@ -35,7 +43,6 @@ app.post("/stk", async (req, res) => {
   try {
     const { phone, amount } = req.body;
 
-    // validation
     if (!phone || !amount) {
       return res.status(400).json({ error: "Missing phone or amount" });
     }
@@ -44,7 +51,6 @@ app.post("/stk", async (req, res) => {
       return res.status(400).json({ error: "Minimum amount is 10" });
     }
 
-    // call Lipana API
     const response = await fetch(
       "https://api.lipana.dev/v1/transactions/push-stk",
       {
@@ -65,7 +71,6 @@ app.post("/stk", async (req, res) => {
 
     const txn = data.data;
 
-    // save transaction
     await db.collection("transactions").doc(txn.transactionId).set({
       transactionId: txn.transactionId,
       checkoutRequestID: txn.checkoutRequestID,
@@ -75,8 +80,8 @@ app.post("/stk", async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
-    return res.json({
-      message: "STK push sent to phone",
+    res.json({
+      message: "STK push sent",
       transactionId: txn.transactionId,
     });
   } catch (err) {
@@ -94,10 +99,9 @@ app.post("/webhook", async (req, res) => {
       return res.status(401).send("Missing signature");
     }
 
-    const payload = req.body; // raw buffer
+    const payload = req.body;
 
-    // verify signature
-    const expectedSignature = crypto
+    const expected = crypto
       .createHmac("sha256", process.env.LIPANA_WEBHOOK_SECRET)
       .update(payload)
       .digest("hex");
@@ -105,49 +109,34 @@ app.post("/webhook", async (req, res) => {
     if (
       !crypto.timingSafeEqual(
         Buffer.from(signature),
-        Buffer.from(expectedSignature)
+        Buffer.from(expected)
       )
     ) {
       return res.status(401).send("Invalid signature");
     }
 
-    // parse JSON AFTER verification
     const data = JSON.parse(payload.toString());
-
-    const event = data.event;
     const txn = data.data;
 
-    console.log("Webhook received:", event, txn.transactionId);
-
-    // update transaction
     const txnRef = db.collection("transactions").doc(txn.transactionId);
 
-    if (event === "payment.success") {
-      await txnRef.update({
-        status: "success",
-        updatedAt: new Date().toISOString(),
-      });
+    if (txn.status === "success") {
+      await txnRef.update({ status: "success" });
 
-      // add credits to user (using phone as ID for now)
-      const userRef = db.collection("users").doc(txn.phone);
-
-      await userRef.set(
-        {
-          credits: admin.firestore.FieldValue.increment(10),
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      await db
+        .collection("users")
+        .doc(txn.phone)
+        .set(
+          {
+            credits: admin.firestore.FieldValue.increment(10),
+          },
+          { merge: true }
+        );
+    } else {
+      await txnRef.update({ status: "failed" });
     }
 
-    if (event === "payment.failed") {
-      await txnRef.update({
-        status: "failed",
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    res.status(200).json({ received: true });
+    res.sendStatus(200);
   } catch (err) {
     console.error("WEBHOOK ERROR:", err);
     res.status(500).send("Webhook error");
@@ -158,5 +147,5 @@ app.post("/webhook", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });
